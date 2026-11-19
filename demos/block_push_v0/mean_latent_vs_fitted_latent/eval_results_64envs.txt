@@ -1,0 +1,10 @@
+mean: 333 s, success 75%
+fitted_4_pushes: 360 s, success 83%
+fitted_16_pushes: 328 s, success 86%
+
+success less than 5cm:
+mean: 83%
+fitted_4_pushes: 92%
+fitted_16_pushes:  92%
+
+mean dist to goal: 16.3 cm
