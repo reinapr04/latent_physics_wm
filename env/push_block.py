@@ -113,6 +113,10 @@ class PushBlockEnv(BaseEnv):
 
     goal_radius = 0.1
     cube_half_size = 0.02  # m, same block size as PushCube-v1
+    # Generic names used by the push primitive, the planner and env.roll_ball (a subclass that
+    # only swaps the object): the object's half size (= its center height when resting) and name.
+    obj_half_size = cube_half_size
+    OBJECT_NAME = "block"
 
     def __init__(
         self,
@@ -201,22 +205,17 @@ class PushBlockEnv(BaseEnv):
             # explicit per-env values (set_physics); unspecified fields keep the sampled value
             per_env = [{**sampled, **given} for sampled, given in zip(per_env, self._physics_override)]
         blocks = []
-        h = self.cube_half_size
+        h = self.obj_half_size
         for i, p in enumerate(per_env):
             material = self._block_materials[i]
             material.static_friction = p["static_friction"]
             material.dynamic_friction = p["dynamic_friction"]
             material.restitution = p["restitution"]
             builder = self.scene.create_actor_builder()
-            builder.add_box_collision(half_size=[h] * 3, material=material)
-            builder.add_box_visual(
-                half_size=[h] * 3,
-                material=sapien.render.RenderMaterial(base_color=np.array([12, 42, 160, 255]) / 255),
-            )
-            builder.set_mass_and_inertia(p["mass"], sapien.Pose(), _box_inertia(p["mass"], h))
+            self._add_object_shape(builder, h, material, p["mass"])
             builder.set_scene_idxs([i])
             builder.set_initial_pose(sapien.Pose(p=[0, 0, h]))
-            block = builder.build(name=f"block-{i}")
+            block = builder.build(name=f"{self.OBJECT_NAME}-{i}")
             block.linear_damping = p["linear_damping"]
             block.angular_damping = p["angular_damping"]
             blocks.append(block)
@@ -242,6 +241,16 @@ class PushBlockEnv(BaseEnv):
             body_type="kinematic",
             initial_pose=sapien.Pose(p=[0, 0, 1e-3]),
         )
+
+    def _add_object_shape(self, builder, h, material, mass):
+        """Collision + visual shape and inertia of the pushed object (a cube of half edge h).
+        Subclasses override this to push something else (env.roll_ball: a sphere of radius h)."""
+        builder.add_box_collision(half_size=[h] * 3, material=material)
+        builder.add_box_visual(
+            half_size=[h] * 3,
+            material=sapien.render.RenderMaterial(base_color=np.array([12, 42, 160, 255]) / 255),
+        )
+        builder.set_mass_and_inertia(mass, sapien.Pose(), _box_inertia(mass, h))
 
     def _apply_table_friction(self):
         sf, df = self.physics.table_static_friction, self.physics.table_dynamic_friction

@@ -105,6 +105,11 @@ class PushPrimitiveConfig:
     # block slides. None = use the arm's damping / stiffness ratio (0.1 s for the Panda).
     velocity_feedforward: Optional[float] = None  # s
     max_lead: float = 0.05  # m
+    # settle: after the primitive, keep simulating with the arm at home until the object's speed
+    # is below settle_speed (m/s) or settle_timeout (s) has passed, so the next observation shows
+    # it at rest (needed for a rolling ball; a block stops by itself while the arm goes home)
+    settle_speed: float = 0.0  # 0 = don't wait
+    settle_timeout: float = 3.0
     # episode
     max_pushes: int = 10  # truncate after this many primitives
     record_frames: bool = False  # store env.render() for every control step in info["push"]["frames"]
@@ -391,6 +396,17 @@ class PushPrimitiveWrapper(gym.Wrapper):
             if cfg.record_frames:
                 frames.append(u.render()[: cfg.record_envs].cpu())
 
+        # settle: wait for the object to stop moving (see PushPrimitiveConfig.settle_speed)
+        settle_time = torch.zeros(n, device=dev)
+        if cfg.settle_speed > 0:
+            for _ in range(int(cfg.settle_timeout / dt)):
+                speed = u.obj.linear_velocity.norm(dim=1)
+                moving = speed > cfg.settle_speed
+                if not bool(moving.any()):
+                    break
+                settle_time += moving.float() * dt
+                self._sim_step(self._low_level_action(target, self._ee_euler0))
+
         # one full env step (holding the home pose) to compute the observation, reward and info
         obs, reward, terminated, truncated, info = u.step(self._low_level_action(target, self._ee_euler0))
 
@@ -411,6 +427,8 @@ class PushPrimitiveWrapper(gym.Wrapper):
             block_displacement=u.obj.pose.p - block_p0,
             timed_out=timed_out,  # some waypoint was not reached in time
             finished=phase == DONE,
+            settle_time=settle_time,  # s spent waiting for the object to stop after the primitive
+            final_speed=u.obj.linear_velocity.norm(dim=1),  # m/s, object speed at the observation
             dt=dt,
         )
         if cfg.record_frames:
@@ -425,17 +443,28 @@ def make_push_env(
     control_freq: int = 50,
     sim_freq: int = 100,
     obs_mode: str = "rgbd",
+    task="block",
     **kwargs,
 ) -> PushPrimitiveWrapper:
-    """Create PushBlock-v1 with the push-primitive action space.
+    """Create a push task (env.tasks: "block" = PushBlock-v1, "ball" = RollBallPhys-v1, or a
+    TaskSpec) with the push-primitive action space.
 
     obs_mode: "rgbd" (default), "pointcloud", "state", "state_dict", "rgb", ...
+    push_config: None = the task's defaults (settle time for the ball).
     Extra kwargs go to gym.make (e.g. sim_backend, render_mode, sensor_configs).
     """
-    import env as _env  # noqa: F401  registers PushBlock-v1
+    import env as _env  # noqa: F401  registers the envs
+    from env.tasks import TaskSpec, get_task
+
+    spec: TaskSpec = task if isinstance(task, TaskSpec) else get_task(task)
+    if push_config is None:
+        push_config = PushPrimitiveConfig()
+    if spec.settle_speed > 0 and push_config.settle_speed == 0:
+        push_config.settle_speed = spec.settle_speed
+        push_config.settle_timeout = spec.settle_timeout
 
     base = gym.make(
-        "PushBlock-v1",
+        spec.env_id,
         num_envs=num_envs,
         physics=physics,
         obs_mode=obs_mode,

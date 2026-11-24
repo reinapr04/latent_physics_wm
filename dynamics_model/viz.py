@@ -22,7 +22,8 @@ def flow_figure(model, latents, t, idx, max_arrows=40):
     red   = moved by the predicted rigid motion (arrows: predicted flow)
     """
     model.eval()
-    R, tr = model(t["pts_in"][idx], t["act_feat"][idx], latents(t["setting"][idx]))
+    R, tr = model(t[model.input_key][idx], t["act_feat"][idx], latents(t["setting"][idx]), act_world=t["action"][idx],
+                  aux=t[model.aux_key][idx] if model.aux_key else None)
     model.train()
     pts = t["pts_loss"][idx]
     gt = apply_rigid(pts, t["R_gt"][idx], t["t_gt"][idx])

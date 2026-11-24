@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore")
 import train_dynamics as T  # noqa: E402
 from dynamics_model.data import TransitionBuffer  # noqa: E402
 from dynamics_model.model import DynamicsModel, LatentTable, apply_rigid, true_flow_magnitude  # noqa: E402
+from env import get_task  # noqa: E402
 from torch.utils.tensorboard import SummaryWriter  # noqa: E402
 
 BINS = [(0.005, 0.05), (0.05, 0.15), (0.15, 0.3), (0.3, 10.0)]
@@ -37,7 +38,7 @@ def predicted_points(model, latents, t, idx):
     out = []
     for i in range(0, len(idx), 1024):
         b = idx[i:i + 1024]
-        R, tr = model(t["pts_in"][b], t["act_feat"][b], latents(t["setting"][b]))
+        R, tr = model(t[model.input_key][b], t["act_feat"][b], latents(t["setting"][b]), act_world=t["action"][b])
         out.append(apply_rigid(t["pts_loss"][b], R, tr))
     return torch.cat(out)
 
@@ -61,11 +62,16 @@ def main():
     ap.add_argument("--members", type=int, default=5)
     ap.add_argument("--steps", type=int, default=20000, help="training steps per member (no early stopping)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--residual", action="store_true", help="residual MLP head (dynamics_model.model)")
+    ap.add_argument("--hidden", type=int, default=256)
+    ap.add_argument("--layers", type=int, default=3)
+    ap.add_argument("--feat-dim", type=int, default=128)
     args = ap.parse_args()
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     buf = TransitionBuffer.load(args.dataset)
+    task = get_task(buf.meta.get("task", "block"))
     dev = "cuda"
     t = buf.tensors(dev)
     _, va = buf.split_indices(dev)
@@ -80,15 +86,17 @@ def main():
     for k in range(args.members):
         seed = args.seed + k
         torch.manual_seed(seed)
-        c = T.Config(max_train_steps=args.steps, patience=10 ** 9, encoder=args.encoder)
-        model = DynamicsModel(latent_dim=c.latent_dim, encoder=args.encoder).to(dev)
+        c = T.Config(max_train_steps=args.steps, patience=10 ** 9, encoder=args.encoder, task=task.name,
+                     residual=args.residual, hidden=args.hidden, layers=args.layers, feat_dim=args.feat_dim)
+        kw = T.model_kwargs(c, task)
+        model = DynamicsModel(**kw).to(dev)
         lat = LatentTable(n_settings, c.latent_dim).to(dev)
         opt = torch.optim.AdamW([{"params": model.parameters(), "lr": c.lr, "weight_decay": c.weight_decay},
                                  {"params": lat.parameters(), "lr": c.latent_lr, "weight_decay": 0.0}])
         t0 = time.time()
         T.train(model, lat, opt, buf, c, dev, SummaryWriter(str(out / f"member{k}")), [0])
-        torch.save({"model": model.state_dict(), "latents": lat.state_dict(), "encoder": args.encoder, "seed": seed},
-                   out / f"member{k}" / "model.pt")
+        torch.save({"model": model.state_dict(), "latents": lat.state_dict(), "encoder": args.encoder, "seed": seed,
+                    "model_kwargs": kw, "task": task.name}, out / f"member{k}" / "model.pt")
         preds.append(predicted_points(model, lat, t, va))
         print(f"\nmember {k} trained in {(time.time() - t0) / 60:.1f} min", flush=True)
         print(header, flush=True)

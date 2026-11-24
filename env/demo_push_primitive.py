@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from mani_skill.utils import sapien_utils
 
-from env import BlockPhysicsConfig, PushPrimitiveConfig, make_push_env
+from env import BlockPhysicsConfig, PushPrimitiveConfig, get_task, make_push_env
 from env.push_primitive import PHASE_NAMES, PUSH
 
 warnings.filterwarnings("ignore")
@@ -29,21 +29,32 @@ TILE = 384  # px per env view
 EXAMPLES_DIR = Path(__file__).resolve().parent / "examples"
 
 
-def random_push(e, max_force, gen):
-    """A random push on a random point of the block's side, roughly towards its centre.
+def random_push(e, max_force, gen, task=None):
+    """A random push on a random point of the object's side, roughly towards its centre.
 
-    The push is described relative to the block and converted to the world-frame action with
-    block_frame_to_world (a policy would instead pick p_contact from the point cloud)."""
-    n = e.unwrapped.num_envs
+    The push is described relative to the object and converted to the world-frame action using
+    the simulator's object pose (a policy would instead pick p_contact from the point cloud)."""
+    task = get_task(task or "block")
+    u = e.unwrapped
+    n = u.num_envs
     ang = torch.rand(n, generator=gen) * 2 * math.pi
     d = torch.stack([torch.cos(ang), torch.sin(ang)], dim=1)
-    local = torch.zeros((n, 3))
-    # the face opposite the push, with a random offset along it, at a random height
-    local[:, :2] = (-d + 0.5 * (torch.rand((n, 2), generator=gen) - 0.5)).clamp(-1, 1)
-    local[:, 2] = torch.rand(n, generator=gen) * 2 - 1
-    p = e.block_frame_to_world(local, d).cpu()
-    force = 0.3 + torch.rand(n, generator=gen) * (max_force - 0.3)
-    duration = 0.3 + torch.rand(n, generator=gen) * 0.9
+    if task.shape == "sphere":
+        c = u.obj.pose.p.cpu()
+        lateral = (torch.rand(n, generator=gen) - 0.5) * task.half_size
+        perp = torch.stack([-d[:, 1], d[:, 0]], 1)
+        half_chord = (task.half_size ** 2 - lateral ** 2).sqrt()
+        p_xy = c[:, :2] + lateral[:, None] * perp - half_chord[:, None] * d
+        z = task.push_height[0] + torch.rand(n, generator=gen) * (task.push_height[1] - task.push_height[0])
+        p = torch.cat([p_xy, z[:, None]], 1)
+    else:
+        local = torch.zeros((n, 3))
+        # the face opposite the push, with a random offset along it, at a random height
+        local[:, :2] = (-d + 0.5 * (torch.rand((n, 2), generator=gen) - 0.5)).clamp(-1, 1)
+        local[:, 2] = torch.rand(n, generator=gen) * 2 - 1
+        p = e.block_frame_to_world(local, d).cpu()
+    force = task.force[0] + torch.rand(n, generator=gen) * (min(max_force, task.force[1]) - task.force[0])
+    duration = task.duration[0] + torch.rand(n, generator=gen) * (task.duration[1] - task.duration[0])
     return torch.cat([p, d, force[:, None], duration[:, None]], dim=1)
 
 
@@ -98,18 +109,23 @@ def main():
     ap.add_argument("--max-force", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--video", default=None,
-                    help="output path (default: env/examples/push_demo_seed<seed>.mp4)")
+                    help="output path (default: env/examples/push_demo_<task>_seed<seed>.mp4)")
+    ap.add_argument("--task", default="block", help="block | ball (env/tasks.py)")
     args = ap.parse_args()
     n = 1 if args.backend == "cpu" else args.num_envs
+    task = get_task(args.task)
 
     e = make_push_env(
         num_envs=n,
+        task=task,
         sim_backend=args.backend,
         obs_mode="rgbd",
         physics=BlockPhysicsConfig(
-            mass=(0.05, 1.0),
-            static_friction=(0.2, 1.0),
-            dynamic_friction=(0.2, 1.0),
+            mass=task.mass,
+            static_friction=task.static_friction,
+            dynamic_friction=task.static_friction,
+            linear_damping=task.linear_damping if task.linear_damping[1] > 0 else 0.0,
+            angular_damping=task.angular_damping if task.angular_damping[1] > 0 else 0.0,
         ),
         push_config=PushPrimitiveConfig(record_frames=True),
         render_mode="rgb_array",
@@ -126,7 +142,7 @@ def main():
     obs_rows = [camera_row(obs)]
 
     for k in range(args.pushes):
-        a = random_push(e, args.max_force, gen)
+        a = random_push(e, args.max_force, gen, task)
         t = time.time()
         obs, reward, terminated, truncated, info = e.step(a)
         obs_rows.append(camera_row(obs))
@@ -150,7 +166,8 @@ def main():
             headers.append([
                 f"env {i}  push {k + 1}/{args.pushes}",
                 f"mass {phys['mass'][i]:.2f}kg  mu_s {phys['static_friction'][i]:.2f}  "
-                f"mu_d {phys['dynamic_friction'][i]:.2f}",
+                f"mu_d {phys['dynamic_friction'][i]:.2f}"
+                + (f"  damp {phys['linear_damping'][i]:.1f}/{phys['angular_damping'][i]:.1f}" if task.shape == "sphere" else ""),
                 f"p ({pc[0]:+.1f},{pc[1]:+.1f},{pc[2]:.1f})cm  {actual}",
                 f"dir {ang:+.0f}deg  F {a[i, 5]:.2f}N  T {a[i, 6]:.2f}s",
             ])
@@ -175,7 +192,7 @@ def main():
     import imageio
 
     if args.video is None:
-        args.video = str(EXAMPLES_DIR / f"push_demo_seed{args.seed}.mp4")
+        args.video = str(EXAMPLES_DIR / f"push_demo_{task.name}_seed{args.seed}.mp4")
     Path(args.video).parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(args.video, video, fps=int(round(1 / info["push"]["dt"])), macro_block_size=8)
     print(f"\nsaved {args.video} ({len(video)} frames)")

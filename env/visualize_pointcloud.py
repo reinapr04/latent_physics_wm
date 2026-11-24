@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from env import BlockPhysicsConfig, make_push_env  # noqa: E402
+from env import BlockPhysicsConfig, get_task, make_push_env  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -74,14 +74,18 @@ def main():
     ap.add_argument("--num-envs", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--after-push", action="store_true", help="also plot the cloud after the push")
-    ap.add_argument("--out", default=None, help="default: env/examples/pointcloud_seed<seed>.png")
+    ap.add_argument("--out", default=None, help="default: env/examples/pointcloud_<task>_seed<seed>.png")
+    ap.add_argument("--task", default="block", help="block | ball (env/tasks.py)")
     args = ap.parse_args()
     n = args.num_envs
+    task = get_task(args.task)
 
     e = make_push_env(
         num_envs=n,
+        task=task,
         obs_mode="pointcloud",
-        physics=BlockPhysicsConfig(mass=(0.1, 0.5), static_friction=(0.3, 0.8), dynamic_friction=(0.3, 0.8)),
+        physics=BlockPhysicsConfig(mass=(0.1, 0.5), static_friction=(0.3, 0.8), dynamic_friction=(0.3, 0.8),
+                                   linear_damping=task.linear_damping[1], angular_damping=task.angular_damping[1]),
     )
     obs, info = e.reset(seed=args.seed)
     u = e.unwrapped
@@ -92,9 +96,13 @@ def main():
     gen = torch.Generator().manual_seed(args.seed)
     ang = torch.rand(n, generator=gen) * 2 * math.pi
     d = torch.stack([torch.cos(ang), torch.sin(ang)], dim=1)
-    local = torch.zeros((n, 3))
-    local[:, :2] = -d
-    p = e.block_frame_to_world(local, d).cpu().numpy()
+    if task.shape == "sphere":
+        c = u.obj.pose.p.cpu()
+        p = torch.cat([c[:, :2] - task.half_size * d, torch.full((n, 1), task.half_size)], 1).numpy()
+    else:
+        local = torch.zeros((n, 3))
+        local[:, :2] = -d
+        p = e.block_frame_to_world(local, d).cpu().numpy()
     d = d.numpy()
 
     stages = [("reset", obs, p, u.obj.pose.p.cpu().numpy())]
@@ -116,7 +124,7 @@ def main():
             plot_env(fig, (nrows, r), 3, xyz, rgb, None if pp is None else pp[i], d[i], title, cam_eye, centers[i])
             r += 1
     fig.tight_layout()
-    out = Path(args.out) if args.out else EXAMPLES_DIR / f"pointcloud_seed{args.seed}.png"
+    out = Path(args.out) if args.out else EXAMPLES_DIR / f"pointcloud_{task.name}_seed{args.seed}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=110)
     print(f"saved {out}")

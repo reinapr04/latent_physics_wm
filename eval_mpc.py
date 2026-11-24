@@ -43,10 +43,11 @@ from dynamics_model.data import TransitionBuffer
 from dynamics_model.geometry import observed_cloud
 from dynamics_model.latent_inference import infer_latents
 from dynamics_model.model import DynamicsModel, Ensemble
-from env import PushPrimitiveConfig, make_push_env
+from env import PushPrimitiveConfig, get_task, make_push_env
 from env.demo_push_primitive import _font, annotate, grid
+from env.observation import OBS_MODE, split_obs
 from policy.mpc import ActionSampler, ProbeSampler, block_position, imagine_next_cloud, random_shooting_mpc
-from train_dynamics import TEST_SEED, Config, make_physics_pool, run_rollout
+from train_dynamics import TEST_SEED, Config, make_physics_pool, run_rollout, task_defaults
 
 warnings.filterwarnings("ignore")
 
@@ -57,21 +58,20 @@ GOAL_HIGH = (0.30, 0.25)
 
 
 def load_model(path, dev):
-    """-> model (DynamicsModel or Ensemble), mean training latent (L,) or (members*L,)."""
+    """-> model (DynamicsModel or Ensemble), mean training latent (L,) or (members*L,), files, task name."""
     path = Path(path)
     files = sorted(path.glob("member*/model.pt")) if path.is_dir() else [path]
     if not files:
         raise FileNotFoundError(f"no checkpoint at {path}")
-    members, z_means = [], []
+    members, z_means, task = [], [], None
     for f in files:
-        ck = torch.load(f, map_location=dev)
-        lat = ck["latents"]["emb.weight"]
-        m = DynamicsModel(latent_dim=lat.shape[1], encoder=ck.get("encoder", "pointnet")).to(dev)
-        m.load_state_dict(ck["model"])
+        ck = torch.load(f, map_location=dev, weights_only=False)
+        m = DynamicsModel.from_checkpoint(ck, dev)
         members.append(m.eval())
-        z_means.append(lat.mean(0))
+        z_means.append(ck["latents"]["emb.weight"][:, : m.latent_dim].mean(0))
+        task = task or ck.get("task") or ck.get("config", {}).get("task")
     model = members[0] if len(members) == 1 else Ensemble(members).eval()
-    return model, torch.cat(z_means), [str(f) for f in files]
+    return model, torch.cat(z_means), [str(f) for f in files], task or "block"
 
 
 def random_goals(block_xy, dist_range, gen):
@@ -93,7 +93,8 @@ def main():
     ap.add_argument("--max-pushes", type=int, default=10, help="MPC pushes per episode")
     ap.add_argument("--samples", type=int, default=1024, help="candidate pushes per MPC step")
     ap.add_argument("--horizon", type=int, default=1, help="pushes planned ahead")
-    ap.add_argument("--goal-dist", type=float, nargs=2, default=(0.10, 0.25), help="m, start-to-goal distance")
+    ap.add_argument("--goal-dist", type=float, nargs=2, default=None, help="m, start-to-goal distance (default: the task's)")
+    ap.add_argument("--task", default=None, help="block | ball (default: read from the checkpoint)")
     ap.add_argument("--success-radius", type=float, default=0.02,
                     help="m, done when the block is this close; also the planner's success radius")
     ap.add_argument("--uniform-fraction", type=float, default=0.1, help="share of MPC candidates placed anywhere")
@@ -107,26 +108,39 @@ def main():
     out = Path(args.out) if args.out else (ck if ck.is_dir() else ck.parent) / "mpc_eval.json"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg = Config(seed=args.seed, num_envs=args.num_envs, pool_size=args.num_envs)
+    model, z_mean, files, ck_task = load_model(args.checkpoint, "cpu")
+    task = get_task(args.task or ck_task)
+    if args.goal_dist is None:
+        args.goal_dist = list(task.goal_dist)
+    cfg = Config(seed=args.seed, num_envs=args.num_envs, pool_size=args.num_envs, task=task.name, **task_defaults(task))
     pool, pool_t = make_physics_pool(cfg)  # same ranges as training, unseen seed
     n_vid = min(args.video_envs, args.num_envs)
     render_kw = dict(render_mode="rgb_array", human_render_camera_configs=dict(
         width=TILE, height=TILE, pose=sapien_utils.look_at([0.45, 0.45, 0.6], [0.05, 0.0, 0.0]))) if n_vid else {}
-    env = make_push_env(num_envs=cfg.num_envs, obs_mode="pointcloud",
+    env = make_push_env(num_envs=cfg.num_envs, obs_mode=OBS_MODE, task=task,
                         push_config=PushPrimitiveConfig(phase_timeout=2.0, record_envs=n_vid), **render_kw)
     u = env.unwrapped
     dev = u.device
-    model, z_mean, files = load_model(args.checkpoint, dev)
-    print(f"model: {len(files)} checkpoint(s) {'(ensemble, mean prediction)' if len(files) > 1 else ''}", flush=True)
+    model, z_mean = model.to(dev), z_mean.to(dev)
+    print(f"task {task.name}; model: {len(files)} checkpoint(s) "
+          f"{'(ensemble, mean prediction)' if len(files) > 1 else ''}, input {model.input_kind}", flush=True)
     n = cfg.num_envs
+    # image-based models (tokens, crops, fusion) compute their inputs from the camera image online
+    from dynamics_model.inputs import attach_inputs, camera_from_obs, model_inputs, planner_inputs
+    image_based = model.input_kind == "image" or bool(model.aux_key)
+    cam = None
 
     # ---------------------------------------------------------------- 1. probe
     n_probe = max(args.probe_pushes, args.oracle_pushes if "fitted_N" in args.conditions else 0)
     print(f"probing: {n_probe} pushes in each of {n} new environments ...", flush=True)
     buf = TransitionBuffer(val_fraction=0.0, seed=args.seed)
-    probe = ProbeSampler()
+    probe = ProbeSampler(shape=task.shape, height=task.probe_height, force=(0.3, cfg.max_force),
+                         duration=(cfg.min_duration + 0.1, cfg.max_duration))
     cfg.pushes_per_rollout = n_probe
-    stats = run_rollout(env, cfg, pool, pool_t, np.arange(n), lambda c, i, g: probe(c, 1)[:, 0], buf, 0)
+    stats = run_rollout(env, cfg, pool, pool_t, np.arange(n), lambda c, i, g, *_: probe(c, 1)[:, 0], buf, 0, task)
+    if image_based:
+        cam = camera_from_obs(env.unwrapped.get_obs())
+        attach_inputs(buf, model, cam, task.half_size, dev)
     data = buf.tensors(dev)
     env_of = data["setting"]
     print(f"kept {len(env_of)} probe transitions (contact rate {stats['contact_rate']:.2f})", flush=True)
@@ -135,7 +149,8 @@ def main():
     def fit(k):
         """Latent per env from its first k kept probes (envs without any keep the mean latent)."""
         idx = torch.cat([(env_of == e).nonzero().flatten()[:k] for e in range(n)])
-        sub = {key: data[key][idx] for key in ["pts_in", "act_feat", "pts_loss", "R_gt", "t_gt"]}
+        keys = [model.input_key, "act_feat", "pts_loss", "R_gt", "t_gt", "action"] + ([model.aux_key] if model.aux_key else [])
+        sub = {key: data[key][idx] for key in keys}
         z = infer_latents(model, sub, env_of[idx], n, z_mean, steps=args.fit_steps, lr=cfg.latent_lr, l2=cfg.latent_l2)
         has = torch.bincount(env_of[idx], minlength=n) > 0
         return torch.where(has[:, None], z, z_mean.expand(n, -1))
@@ -154,7 +169,7 @@ def main():
     # ---------------------------------------------------------------- 3. MPC episodes
     env.cfg.record_frames = bool(n_vid)  # frames for the episodes only, not the probes
     sampler = ActionSampler(uniform_fraction=args.uniform_fraction, force=(cfg.min_force, cfg.max_force),
-                            duration=(cfg.min_duration, cfg.max_duration))
+                            duration=(cfg.min_duration, cfg.max_duration), height=task.push_height, shape=task.shape)
     # a push in the air above the far corner: keeps finished envs still while the others push
     idle = torch.tensor([-0.25, 0.35, 0.15, 0.0, 1.0, 0.2, 0.3], device=dev)
     # the same block start and goal for every condition (passed to reset explicitly)
@@ -180,11 +195,15 @@ def main():
             writer = imageio.get_writer(str(out.parent / f"mpc_{c}.mp4"), fps=25, macro_block_size=8)
         t0 = time.time()
         for step in range(args.max_pushes):
+            obs, img = split_obs(obs, env)
             cloud, _ = observed_cloud(obs, cfg.n_in, cfg.table_points)
+            inputs_fn = planner_inputs(model, img, cam, task.half_size, dev) if image_based else None
             a, _ = random_shooting_mpc(model, cloud, latents[c], goal, sampler, num_samples=args.samples,
-                                       horizon=args.horizon, goal_radius=args.success_radius)
-            with torch.no_grad():  # where the model expects this push to leave the block
-                pred_xy = block_position(imagine_next_cloud(model, cloud, a, latents[c]))[:, :2]
+                                       horizon=args.horizon, goal_radius=args.success_radius,
+                                       half_size=task.half_size, inputs_fn=inputs_fn)
+            with torch.no_grad():  # where the model expects this push to leave the object
+                chosen = inputs_fn(torch.arange(n, device=dev), a) if inputs_fn else None
+                pred_xy = block_position(imagine_next_cloud(model, cloud, a, latents[c], chosen), task.half_size)[:, :2]
             a = torch.where(done[:, None], idle.expand(n, -1), a)
             was_done = done.clone()
             p_before = u.obj.pose.p[:, :2].clone()
@@ -213,7 +232,9 @@ def main():
                 for s in range(0, frames.shape[0], args.video_stride):
                     tiles = [annotate(frames[s, i].numpy(), [
                         f"env{i} {c}  {phys['mass'][i]:.2f}kg mu {phys['static_friction'][i]:.2f}"
-                        f"/{phys['dynamic_friction'][i]:.2f}", status[i][0]], status[i][1], font)
+                        f"/{phys['dynamic_friction'][i]:.2f}"
+                        + (f" damp {phys['linear_damping'][i]:.1f}/{phys['angular_damping'][i]:.1f}" if task.name == "ball" else ""),
+                        status[i][0]], status[i][1], font)
                         for i in range(n_vid)]
                     writer.append_data(grid(tiles, math.ceil(math.sqrt(n_vid))))
             if done.all():
@@ -253,7 +274,7 @@ def main():
     if n_vid:
         print("\nvideos: " + ", ".join(str(out.parent / f"mpc_{c}.mp4") for c in args.conditions))
 
-    out.write_text(json.dumps({"args": vars(args), "checkpoints": files, "start_to_goal_cm": d0.mean().item(),
+    out.write_text(json.dumps({"args": vars(args), "task": task.name, "checkpoints": files, "start_to_goal_cm": d0.mean().item(),
                                "results": results, "distance_curves_cm": curves}, indent=2))
     print(f"\nsaved {out}  ({(time.time() - t_start) / 60:.1f} min)")
 
