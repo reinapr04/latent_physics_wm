@@ -8,3 +8,17 @@ fitted_4_pushes: 92%
 fitted_16_pushes:  92%
 
 mean dist to goal: 16.3 cm
+
+
+Harder version:
+
+64 envs, start-to-goal 23.3 cm (mean), up to 2 pushes, success = within 2 cm
+latent      success   <5cm  final dist (cm)  pushes  off table  pred err (cm)
+mean            30%    61%     5.9 (med  3.6)     1.5         2%           5.16
+fitted          44%    72%     4.5 (med  2.3)     1.4         0%           2.84
+fitted_N        48%    72%     4.3 (med  2.1)     1.5         0%           2.94
+
+mean distance to goal (cm) after each push:
+mean        23.3   6.8   5.9
+fitted      23.3   5.3   4.5
+fitted_N    23.3   5.7   4.3
