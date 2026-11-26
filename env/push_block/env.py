@@ -1,14 +1,18 @@
-"""PushBlock-v1: a ManiSkill push task with configurable block physics.
+"""PushBlock-v1: ManiSkill's PushCube-v1 with configurable block physics.
 
-A Panda arm must push a block into a goal region in front of it. Unlike the stock
-PushCube-v1, the block's physical properties (mass, friction, restitution, damping) and
-the table friction are configurable, either as fixed values or as (low, high) ranges that
-are sampled independently for each parallel env. The block's size is fixed: PushCube's
-default 4 cm cube (cube_half_size = 0.02 m).
+PushBlockEnv extends mani_skill's PushCubeEnv (same robot, table, 4 cm cube, goal target,
+success condition, observations and dense reward) and changes only what is needed:
+  - the block's physics (mass, friction, restitution, damping) and the table friction are
+    configurable, as fixed values or (low, high) ranges sampled per parallel env, or set
+    exactly per env with set_physics(); the realised values are in info["physics"]
+  - a workaround for a SAPIEN GPU material bug (see _init_material_pool)
+  - optional tracking of the contact force the gripper applies to the block
+  - a fixed camera framing the workspace (for point clouds)
+  - reset options to place the block and the goal explicitly
 
-Important: PhysX fixes these properties when the scene is built, so they are applied
-during reconfiguration, not on every reset. New values are sampled from ranges only
-when you call ``env.reset(options={"reconfigure": True})`` (or set ``reconfiguration_freq``).
+Important: PhysX fixes these properties when the scene is built, so they are applied during
+reconfiguration, not on every reset. New values are sampled from ranges only when you call
+``env.reset(options={"reconfigure": True})`` (or set ``reconfiguration_freq``).
 
 Example:
     import gymnasium as gym
@@ -26,25 +30,21 @@ Example:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
-from typing import Any, Optional, Union
+from dataclasses import dataclass, fields
+from typing import Optional, Union
 
 import numpy as np
 import sapien
 import torch
-from transforms3d.euler import euler2quat
 
 from mani_skill.agents.robots import Panda
-from mani_skill.envs.sapien_env import BaseEnv
+from mani_skill.envs.tasks.tabletop.push_cube import PushCubeEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
-
-from .reward import block_reward
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs import Actor, Pose
-from mani_skill.utils.structs.types import Array, GPUMemoryConfig, SimConfig
 
 # A physics parameter is either a fixed value or a (low, high) range sampled uniformly.
 Param = Union[float, tuple[float, float]]
@@ -94,32 +94,26 @@ def _box_inertia(mass: float, half_size: float) -> np.ndarray:
 
 
 @register_env("PushBlock-v1", max_episode_steps=50)
-class PushBlockEnv(BaseEnv):
+class PushBlockEnv(PushCubeEnv):
     """
-    **Task Description:**
-    Push a block into a goal region in front of it.
+    **Task Description:** PushCube-v1 (push the block into the goal region in front of it),
+    with configurable block physics.
 
     **Randomizations:**
-    - block xy position uniformly in [-0.1, 0.1]^2 on the table, placed flat
-    - goal is at block xy + [0.1 + goal_radius, 0]
+    - as PushCube-v1: block xy uniformly in [-0.1, 0.1]^2, placed flat; goal at block xy +
+      [0.1 + goal_radius, 0]. Reset options "block_xy" / "goal_xy" ((num_envs, 2)) override them
     - block physics as specified by `physics` (fixed values or per-env ranges)
 
-    **Success Conditions:**
-    - block xy is within goal_radius of the goal xy and the block is still on the table
+    **Success Conditions:** as PushCube-v1 (block xy within goal_radius of the goal, on the table)
     """
 
-    SUPPORTED_ROBOTS = ["panda"]
+    SUPPORTED_ROBOTS = ["panda"]  # contact tracking uses the Panda gripper's links
     agent: Panda
-
-    goal_radius = 0.1
-    cube_half_size = 0.02  # m, same block size as PushCube-v1
 
     def __init__(
         self,
         *args,
         physics: Union[BlockPhysicsConfig, dict, None] = None,
-        robot_uids="panda",
-        robot_init_qpos_noise=0.02,
         track_contact_force: bool = False,
         **kwargs,
     ):
@@ -128,12 +122,12 @@ class PushBlockEnv(BaseEnv):
         elif isinstance(physics, dict):
             physics = BlockPhysicsConfig.from_dict(physics)
         self.physics = physics
-        self.robot_init_qpos_noise = robot_init_qpos_noise
+        self._physics_override = None
         # If True, the contact force the gripper (fingers + hand) applies to the block is
         # averaged over every physics sub-step of a control step and exposed as
         # self.pusher_contact_force / info["pusher_contact_force"] (num_envs, 3), in N, world frame.
         self.track_contact_force = track_contact_force
-        super().__init__(*args, robot_uids=robot_uids, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def set_physics(self, per_env: Optional[list[dict]]):
         """Use these exact block physics (one dict per parallel env, e.g. {"mass": 0.3,
@@ -146,28 +140,12 @@ class PushBlockEnv(BaseEnv):
         self._physics_override = per_env
 
     @property
-    def _default_sim_config(self):
-        return SimConfig(
-            gpu_memory_config=GPUMemoryConfig(
-                found_lost_pairs_capacity=2**25, max_rigid_patch_count=2**18
-            )
-        )
-
-    @property
     def _default_sensor_configs(self):
         # Fixed third-person camera on the far side of the table from the robot, framing the
         # workspace around the block (~0.8 m across), so a 4 cm block is ~12 px wide. Override
         # with gym.make(..., sensor_configs=dict(width=..., height=..., pose=...)).
         pose = sapien_utils.look_at(eye=[0.6, 0.25, 0.6], target=[0.05, 0.0, 0.0])
         return [CameraConfig("base_camera", pose=pose, width=256, height=256, fov=1.0, near=0.01, far=10)]
-
-    @property
-    def _default_human_render_camera_configs(self):
-        pose = sapien_utils.look_at([0.6, 0.7, 0.6], [0.0, 0.0, 0.35])
-        return CameraConfig("render_camera", pose=pose, width=512, height=512, fov=1, near=0.01, far=100)
-
-    def _load_agent(self, options: dict):
-        super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
 
     # ------------------------------------------------------------------ scene
     def _init_material_pool(self):
@@ -187,6 +165,8 @@ class PushBlockEnv(BaseEnv):
         self._table_material = sapien.physx.PhysxMaterial(0.5, 0.5, 0.0)
 
     def _load_scene(self, options: dict):
+        # Replaces PushCubeEnv._load_scene, which builds one cube with a fixed material shared
+        # by all envs: here every env gets its own block with its own physics.
         self._init_material_pool()
 
         self.table_scene = TableSceneBuilder(env=self, robot_init_qpos_noise=self.robot_init_qpos_noise)
@@ -197,7 +177,7 @@ class PushBlockEnv(BaseEnv):
         # them into a single Actor view for batched pose/velocity access.
         names = BlockPhysicsConfig.block_fields()
         per_env = [self.physics.sample(self._batched_episode_rng[i]) for i in range(self.num_envs)]
-        if getattr(self, "_physics_override", None) is not None:
+        if self._physics_override is not None:
             # explicit per-env values (set_physics); unspecified fields keep the sampled value
             per_env = [{**sampled, **given} for sampled, given in zip(per_env, self._physics_override)]
         blocks = []
@@ -233,6 +213,7 @@ class PushBlockEnv(BaseEnv):
         self._reset_contact_accumulator()
         self.pusher_contact_force = torch.zeros((self.num_envs, 3), device=self.device)
 
+        # as in PushCubeEnv
         self.goal_region = actors.build_red_white_target(
             self.scene,
             radius=self.goal_radius,
@@ -257,29 +238,25 @@ class PushBlockEnv(BaseEnv):
                 shape.set_physical_material(mat)
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        # PushCubeEnv places the block randomly and the goal in front of it
+        super()._initialize_episode(env_idx, options)
         with torch.device(self.device):
             b = len(env_idx)
-            self.table_scene.initialize(env_idx)
-
             # options["block_xy"] / options["goal_xy"] ((num_envs, 2)) place the block / goal
-            # explicitly (e.g. the same start for several evaluation runs); default: random
-            # block, goal 0.2 m in front of it
-            xyz = torch.zeros((b, 3))
-            if options.get("block_xy") is not None:
-                xyz[..., :2] = torch.as_tensor(options["block_xy"], dtype=torch.float32).to(self.device)[env_idx]
-            else:
-                xyz[..., :2] = torch.rand((b, 2)) * 0.2 - 0.1
-            xyz[..., 2] = self.block_half_size[env_idx]
-            self.obj.set_pose(Pose.create_from_pq(p=xyz, q=[1, 0, 0, 0]))
+            # explicitly (e.g. the same start for several evaluation runs)
+            if options.get("block_xy") is not None or options.get("goal_xy") is not None:
+                xyz = self.obj.pose.p[env_idx].clone()
+                if options.get("block_xy") is not None:
+                    xyz[..., :2] = torch.as_tensor(options["block_xy"], dtype=torch.float32).to(self.device)[env_idx]
+                    self.obj.set_pose(Pose.create_from_pq(p=xyz, q=[1, 0, 0, 0]))
+                goal_xyz = self.goal_region.pose.p[env_idx].clone()
+                goal_xyz[..., :2] = xyz[..., :2] + torch.tensor([0.1 + self.goal_radius, 0])
+                if options.get("goal_xy") is not None:
+                    goal_xyz[..., :2] = torch.as_tensor(options["goal_xy"], dtype=torch.float32).to(self.device)[env_idx]
+                self.goal_region.set_pose(Pose.create_from_pq(p=goal_xyz, q=self.goal_region.pose.q[env_idx]))
             self.obj.set_linear_velocity(torch.zeros((b, 3)))
             self.obj.set_angular_velocity(torch.zeros((b, 3)))
             self.pusher_contact_force[env_idx] = 0
-
-            goal_xyz = xyz + torch.tensor([0.1 + self.goal_radius, 0, 0])
-            if options.get("goal_xy") is not None:
-                goal_xyz[..., :2] = torch.as_tensor(options["goal_xy"], dtype=torch.float32).to(self.device)[env_idx]
-            goal_xyz[..., 2] = 1e-3
-            self.goal_region.set_pose(Pose.create_from_pq(p=goal_xyz, q=euler2quat(0, np.pi / 2, 0)))
 
     # ------------------------------------------------------- contact sensing
     def _reset_contact_accumulator(self):
@@ -301,36 +278,12 @@ class PushBlockEnv(BaseEnv):
         self._reset_contact_accumulator()
 
     # ------------------------------------------------------------- task logic
-    def _block_reward(self):
-        return block_reward(self.obj.pose.p, self.goal_region.pose.p[..., :2], self.block_half_size, self.goal_radius)
-
     def evaluate(self):
-        info = {
-            "success": self._block_reward()[1],
-            "physics": self.block_physics,
-        }
+        # PushCubeEnv's success, plus the physics (and contact force)
+        info = super().evaluate()
+        info["physics"] = self.block_physics
         if self.track_contact_force:
             info["pusher_contact_force"] = self.pusher_contact_force
         return info
 
-    def _get_obs_extra(self, info: dict):
-        obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
-        if self.obs_mode_struct.use_state:
-            obs.update(goal_pos=self.goal_region.pose.p, obj_pose=self.obj.pose.raw_pose)
-        return obs
-
-    def compute_dense_reward(self, obs: Any, action: Array, info: dict):
-        h = self.block_half_size
-        push_offset = torch.zeros_like(self.obj.pose.p)
-        push_offset[:, 0] = -h - 0.005
-        tcp_to_push_dist = torch.linalg.norm(self.obj.pose.p + push_offset - self.agent.tcp.pose.p, axis=1)
-        reward = 1 - torch.tanh(5 * tcp_to_push_dist)
-
-        reached = tcp_to_push_dist < 0.01
-        reward += self._block_reward()[0] * reached
-
-        reward[info["success"]] = 4
-        return reward
-
-    def compute_normalized_dense_reward(self, obs: Any, action: Array, info: dict):
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 4.0
+    # observations and the dense reward are PushCubeEnv's (see reward.py for the planner copy)

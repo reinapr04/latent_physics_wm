@@ -5,7 +5,7 @@ For each new environment (one unseen physics setting each, all run in parallel):
   2. fit the latent on them, dynamics model frozen (dynamics_model.latent_inference)
   3. reset the block, pick a random goal, and push it there with MPC planning with that latent:
      every push, sample candidate pushes, predict each outcome with the model, score it with
-     the env's reward (env.reward.block_reward), execute the best one, observe, replan.
+     the env's reward (env.push_block.reward.block_reward), execute the best one, observe, replan.
 
 Step 3 is repeated with each latent condition, from the same start and goal:
   mean      mean of the training latents (no adaptation)

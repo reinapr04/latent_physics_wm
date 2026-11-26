@@ -107,7 +107,10 @@ class TransformerEncoder(nn.Module):
 
 
 class DynamicsModel(nn.Module):
-    def __init__(self, latent_dim=8, feat_dim=128, hidden=256, layers=3, encoder="pointnet"):
+    def __init__(self, latent_dim=8, feat_dim=128, hidden=256, layers=3, encoder="pointnet",
+                 action_scale=ACTION_SCALE):
+        """action_scale: typical (p_z, F, T) of the task, the action features are divided by it.
+        Stored in the state dict, so a loaded checkpoint keeps the scale it was trained with."""
         super().__init__()
         assert encoder in ENCODERS, f"encoder must be one of {ENCODERS}"
         self.latent_dim = latent_dim
@@ -130,7 +133,7 @@ class DynamicsModel(nn.Module):
         self.head = nn.Sequential(*mods)
         nn.init.zeros_(self.head[-1].weight)  # start by predicting "no motion"
         nn.init.zeros_(self.head[-1].bias)
-        self.register_buffer("action_scale", torch.tensor(ACTION_SCALE))
+        self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
 
     def forward(self, pts_frame, act_feat, z):
         """pts_frame (B, N, 3): input cloud in the action frame; act_feat (B, 3): (p_z, F, T);

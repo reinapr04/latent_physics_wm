@@ -141,30 +141,30 @@ def _in_box(xyz, lo, hi):
     return ((xyz > lo) & (xyz < hi)).all(-1)
 
 
-def observed_cloud(obs, n, table_points=100):
+def observed_cloud(obs, n, table_points=100, workspace=(WORKSPACE_LOW, WORKSPACE_HIGH)):
     """The observed cloud the model works with (world frame), exactly n points per env:
-      - every observed point above the table plane (the block) comes first;
-      - then min(table_points, n - block points) table points, evenly spread over the observed
-        table by farthest point sampling (the table's outline: where on the table it pushes);
-      - any slots left over repeat the block points (PointNet max-pools, so repeats change
-        nothing). With more than n block points: n of them by farthest point sampling, no table.
+      - the observed points above the table plane (the object): all of them when there are at
+        most n - table_points, otherwise n - table_points of them by farthest point sampling
+        (evenly spread over the object);
+      - object slots left over repeat the object points (PointNet max-pools, so repeats change
+        nothing);
+      - then table_points table points, evenly spread over the observed table by farthest
+        point sampling (the table's outline: where on the table it pushes).
+    For the block (at most ~330 points) this is every block point plus table_points table
+    points; for the T (~1500-2500 points) the T is subsampled so the table points still fit.
+    workspace: (low, high) world-frame box the cloud is cropped to (the table area the object
+    can be on; the top drops the parked arm).
     Returns (B, n, 3) and the number of observed points above the table (B,)."""
     xyzw = obs["pointcloud"]["xyzw"]
     xyz = xyzw[..., :3]
-    in_ws = (xyzw[..., 3] > 0) & _in_box(xyz, WORKSPACE_LOW, WORKSPACE_HIGH)
+    in_ws = (xyzw[..., 3] > 0) & _in_box(xyz, *workspace)
     raised = in_ws & (xyz[..., 2] > TABLE_Z)
-    block, count = fixed_size_points(xyz, raised, n)  # all block points first, then repeats
+    obj, count = fixed_size_points(xyz, raised, n - table_points)  # object points first, then repeats
     if table_points == 0:
-        return block, count
-    n_table = (n - count).clamp(min=0, max=table_points)  # (B,) table slots per env
-    first_table_slot = n - n_table
+        return obj, count
     idx = farthest_point_indices(xyz, in_ws & ~raised, table_points)
     table = torch.gather(xyz, 1, idx[..., None].expand(-1, -1, 3))  # (B, table_points, 3)
-    slot = torch.arange(n, device=xyz.device)[None]
-    use_table = slot >= first_table_slot[:, None]
-    table_slot = (slot - first_table_slot[:, None]).clamp(0, table_points - 1)
-    table = torch.gather(table, 1, table_slot[..., None].expand(-1, -1, 3))
-    return torch.where(use_table[..., None], table, block), count
+    return torch.cat([obj, table], 1), count
 
 
 def model_input(clouds, actions):

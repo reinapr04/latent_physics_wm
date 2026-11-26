@@ -23,6 +23,7 @@ contains pushes that miss the block.
 Run from the repo root:
     python train_dynamics.py --run-dir runs/dynamics0
     python train_dynamics.py --run-dir runs/quick --num-envs 8 --pool-size 16 --iterations 2   # smoke test
+    python train_dynamics.py --task push_t --run-dir runs/push_t0 --iterations 0   # the T (random pushes only, for now)
 
 TensorBoard (loss curves, rollout stats, predicted vs. true point flow figures):
     .venv/bin/tensorboard --logdir runs --port 6009
@@ -37,6 +38,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -44,6 +46,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dynamics_model.data import TransitionBuffer
 from dynamics_model.geometry import (
+    WORKSPACE_HIGH,
+    WORKSPACE_LOW,
     action_features,
     action_frame,
     block_points,
@@ -54,6 +58,7 @@ from dynamics_model.geometry import (
     world_transform_to_frame,
 )
 from dynamics_model.model import (
+    ACTION_SCALE,
     ENCODERS,
     DynamicsModel,
     LatentTable,
@@ -63,7 +68,9 @@ from dynamics_model.model import (
 )
 from dynamics_model.viz import flow_figure, plt
 from env import PushPrimitiveConfig, make_push_env
-from policy.mpc import ActionSampler, random_shooting_mpc
+from env.push_t import WORKSPACE as PUSH_T_WORKSPACE
+from env.push_t import make_push_t_env
+from policy.mpc import UNIFORM_HIGH, UNIFORM_LOW, ActionSampler, random_shooting_mpc
 
 warnings.filterwarnings("ignore")
 
@@ -71,6 +78,10 @@ warnings.filterwarnings("ignore")
 @dataclass
 class Config:
     run_dir: str = "runs/dynamics"
+    # which env: "push_block" (PushBlock-v1, gripper) or "push_t" (PushTPhysics-v1, stick). The
+    # physics / push ranges below are the block's; push_t replaces the ones in TASK_DEFAULTS
+    # unless they are given explicitly.
+    task: str = "push_block"
     seed: int = 0
     # resume: continue from a previous run (its dataset, physics pool, model and latents, and
     # rollout count). init_model optionally replaces its model + latents with another checkpoint
@@ -131,6 +142,55 @@ class Config:
     point_noise: float = 0.001  # m, Gaussian noise on the input points
 
 
+# ------------------------------------------------------------------ tasks
+TASKS = ["push_block", "push_t"]
+
+# Config values that differ per task (the Config defaults are push_block's).
+TASK_DEFAULTS = {
+    "push_block": {},
+    "push_t": dict(
+        mass=(0.35, 1.05),  # kg, around stock PushT's 0.7 (env.push_t.PHYSICS_RANGES)
+        static_friction=(0.8, 2.5),  # T-table, around stock PushT's 1.65
+        # sliding takes mu * m * g, ~3-26 N over these ranges; force beyond it while the T slides
+        # only accelerates it, so pushes are short
+        min_force=1.0,
+        max_force=25.0,
+        min_duration=0.2,
+        max_duration=0.6,
+        # the camera sees ~1500-2500 T points (7x the block's area): 924 of them (+100 table)
+        # space them ~4 mm apart (412 would be ~6.5 mm), for where a push meets the T's edge
+        n_in=1024,
+    ),
+}
+
+
+def task_spec(name):
+    """What differs between the tasks besides the Config values: the env, the pushed object,
+    the point-cloud crop, the push heights, where uniform pushes go, and the force scale."""
+    if name == "push_block":
+        return SimpleNamespace(
+            make_env=lambda n: make_push_env(num_envs=n, obs_mode="pointcloud",
+                                             push_config=PushPrimitiveConfig(phase_timeout=2.0)),
+            obj="obj",  # env attribute of the pushed object
+            goal_xy=lambda u: u.goal_region.pose.p[:, :2],
+            workspace=(WORKSPACE_LOW, WORKSPACE_HIGH),
+            height=(0.01, 0.05),  # m, p_z of sampled pushes (the block is 4 cm tall)
+            uniform_box=(UNIFORM_LOW, UNIFORM_HIGH),
+            action_scale=ACTION_SCALE,
+        )
+    if name == "push_t":
+        return SimpleNamespace(
+            make_env=lambda n: make_push_t_env(num_envs=n, obs_mode="pointcloud"),
+            obj="tee",
+            goal_xy=lambda u: u.goal_tee.pose.p[:, :2],
+            workspace=PUSH_T_WORKSPACE,
+            height=(0.01, 0.035),  # m, stick tip heights that touch the 4 cm T
+            uniform_box=((-0.40, -0.35), (0.10, 0.30)),  # around the T's spawn area and goal
+            action_scale=(0.04, 20.0, 1.0),  # p_z (m), F (N), T (s)
+        )
+    raise ValueError(f"unknown task {name!r}; choose from {TASKS}")
+
+
 # ------------------------------------------------------------------ settings
 # Seed of the held-out test settings (eval_latent_inference.py). Training settings never use it,
 # and since physics values are drawn from continuous ranges, test settings are always unseen.
@@ -166,27 +226,33 @@ def settings_for_rollout(counts, num_envs, rng: np.random.Generator):
 def run_rollout(env, cfg, pool, pool_t, ids, policy, buf, rollout_idx):
     u = env.unwrapped
     dev = u.device
+    task = task_spec(cfg.task)
     u.set_physics([pool[i] for i in ids])
     obs, _ = env.reset(seed=cfg.seed * 100_000 + rollout_idx, options={"reconfigure": True})
-    seg_ids = torch.tensor([o.per_scene_id for o in u.obj._objs], device=dev)
+    obj = getattr(u, task.obj)  # the pushed object (block or T)
+    seg_ids = torch.tensor([o.per_scene_id for o in obj._objs], device=dev)
     ids_t = torch.as_tensor(ids, device=dev)
-    goal = u.goal_region.pose.p[:, :2].clone()
-    n_added, contact = 0, []
+    goal = task.goal_xy(u).clone()
+    n_added, contact, unreachable = 0, [], []
     for _ in range(cfg.pushes_per_rollout):
-        cloud, n_obs = observed_cloud(obs, cfg.n_in, cfg.table_points)
+        cloud, n_obs = observed_cloud(obs, cfg.n_in, cfg.table_points, task.workspace)
         loss_pts, valid_loss = block_points(obs, seg_ids, cfg.n_loss)
         a = policy(cloud, ids_t, goal)
         pts_in = model_input(cloud, a)
         valid_in = n_obs >= 10
-        p0, q0 = u.obj.pose.p.clone(), u.obj.pose.q.clone()
+        p0, q0 = obj.pose.p.clone(), obj.pose.q.clone()
         obs, _, _, _, info = env.step(a)
-        p1, q1 = u.obj.pose.p.clone(), u.obj.pose.q.clone()
+        p1, q1 = obj.pose.p.clone(), obj.pose.q.clone()
 
         R, t = pose_change(p0, q0, p1, q1)
         origin, R_a = action_frame(a)
         R_f, t_f = world_transform_to_frame(R, t, origin, R_a)
         still_on_table = (p0[:, 2] > 0) & (p1[:, 2] > 0)
-        keep = valid_in & valid_loss & still_on_table & torch.isfinite(t_f).all(-1)
+        # a push whose start point the arm can't reach (push_t) is not made: no physics to learn,
+        # and the model (which sees the cloud relative to the push) can't tell reachability
+        not_made = info["push"].get("unreachable", torch.zeros_like(still_on_table))
+        keep = valid_in & valid_loss & still_on_table & ~not_made & torch.isfinite(t_f).all(-1)
+        unreachable.append(not_made.float().mean().item())
         buf.add(
             pts_in=pts_in[keep],
             pts_loss=world_to_frame(loss_pts, origin, R_a)[keep],
@@ -200,15 +266,16 @@ def run_rollout(env, cfg, pool, pool_t, ids, policy, buf, rollout_idx):
         )
         n_added += int(keep.sum())
         contact.append(info["push"]["made_contact"].float().mean().item())
-    dist = (u.obj.pose.p[:, :2] - goal).norm(dim=-1)
-    on_table = u.obj.pose.p[:, 2] > 0
+    dist = (obj.pose.p[:, :2] - goal).norm(dim=-1)
+    on_table = obj.pose.p[:, 2] > 0
     return {
         "samples": n_added,
         "contact_rate": float(np.mean(contact)),
-        # mean over blocks still on the table (one block knocked onto the floor would dominate)
+        "unreachable_rate": float(np.mean(unreachable)),
+        # mean over objects still on the table (one knocked onto the floor would dominate)
         "final_goal_dist_cm": 100 * dist[on_table].mean().item() if on_table.any() else float("nan"),
         "off_table": (~on_table).float().mean().item(),
-        "success": ((dist < u.goal_radius) & on_table).float().mean().item(),
+        "success": info["success"].float().mean().item(),  # the env's own success test
     }
 
 
@@ -328,6 +395,7 @@ def train(model, latents, opt, buf, cfg, dev, tb, step, max_steps=None):
 # ------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    per_task = set().union(*TASK_DEFAULTS.values())
     for f, v in asdict(Config()).items():
         if isinstance(v, bool):
             kw = dict(action=argparse.BooleanOptionalAction)
@@ -339,8 +407,20 @@ def main():
             kw["choices"] = ["absolute", "relative"]
         if f == "encoder":
             kw["choices"] = ENCODERS
-        ap.add_argument("--" + f.replace("_", "-"), default=v, **kw)
-    cfg = Config(**{k: tuple(v) if isinstance(v, list) else v for k, v in vars(ap.parse_args()).items()})
+        if f == "task":
+            kw["choices"] = TASKS
+        # values that differ per task default to None here: filled from the task below
+        ap.add_argument("--" + f.replace("_", "-"), default=None if f in per_task else v, **kw)
+    args = {k: tuple(v) if isinstance(v, list) else v for k, v in vars(ap.parse_args()).items()}
+    # precedence: explicit command-line value > the task's default > Config default (push_block's)
+    for k, v in TASK_DEFAULTS[args["task"]].items():
+        if args[k] is None:
+            args[k] = v
+    cfg = Config(**{k: v for k, v in args.items() if v is not None})
+    task = task_spec(cfg.task)
+    if cfg.task == "push_t" and cfg.iterations > 0:
+        raise SystemExit("push_t: the MPC rounds need the T's coverage reward, which isn't built yet. "
+                         "Run with --iterations 0 (random-push data + training) for now.")
 
     run_dir = Path(cfg.run_dir)
     if cfg.resume_from:
@@ -375,10 +455,10 @@ def main():
     pool_t = pool_tensor(pool)
     (run_dir / "physics_pool.json").write_text(json.dumps(pool, indent=2))
 
-    env = make_push_env(num_envs=cfg.num_envs, obs_mode="pointcloud", push_config=PushPrimitiveConfig(phase_timeout=2.0))
+    env = task.make_env(cfg.num_envs)
     dev = env.unwrapped.device
 
-    model = DynamicsModel(latent_dim=cfg.latent_dim, encoder=cfg.encoder).to(dev)
+    model = DynamicsModel(latent_dim=cfg.latent_dim, encoder=cfg.encoder, action_scale=task.action_scale).to(dev)
     latents = LatentTable(len(pool), cfg.latent_dim).to(dev)
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])
@@ -391,7 +471,8 @@ def main():
         {"params": model.parameters(), "lr": cfg.lr, "weight_decay": cfg.weight_decay},
         {"params": latents.parameters(), "lr": cfg.latent_lr, "weight_decay": 0.0},
     ])
-    ranges = dict(force=(cfg.min_force, cfg.max_force), duration=(cfg.min_duration, cfg.max_duration))
+    ranges = dict(force=(cfg.min_force, cfg.max_force), duration=(cfg.min_duration, cfg.max_duration),
+                  height=task.height, uniform_low=task.uniform_box[0], uniform_high=task.uniform_box[1])
     random_sampler = ActionSampler(uniform_fraction=cfg.random_uniform_fraction, **ranges)
     mpc_sampler = ActionSampler(uniform_fraction=cfg.mpc_uniform_fraction, **ranges)
     log = open(run_dir / "metrics.jsonl", "a")
@@ -402,7 +483,7 @@ def main():
 
     def save():
         torch.save({"model": model.state_dict(), "latents": latents.state_dict(), "config": asdict(cfg),
-                    "encoder": cfg.encoder, "physics_pool": pool}, run_dir / "checkpoint.pt")
+                    "encoder": cfg.encoder, "task": cfg.task, "physics_pool": pool}, run_dir / "checkpoint.pt")
         buf.save(run_dir / "dataset.pt")
     tb = SummaryWriter(str(run_dir / "tb"))
     step = [0]  # global gradient step

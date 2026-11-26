@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import torch
 
 from dynamics_model.geometry import TABLE_Z, action_features, action_frame, model_input
-from env.reward import block_reward
+from env.push_block.reward import block_reward
 
 # where uniform pushes are placed (world frame, m)
 UNIFORM_LOW = (-0.25, -0.30)
@@ -53,6 +53,8 @@ class ActionSampler:
     duration: tuple = (0.3, 0.8)  # s (longer pushes mostly just launch the block once it slides)
     top_band: float = 0.006  # m, raised points this close to the highest one count as top face
     line_width: float = 0.005  # m, half-width of the band used to find the entry point
+    uniform_low: tuple = UNIFORM_LOW  # m, world xy box for the uniform pushes
+    uniform_high: tuple = UNIFORM_HIGH
 
     def __call__(self, clouds, k):
         """clouds (M, N, 3) world (table included) -> actions (M, k, 7) = [p(3), d(2), F, T]."""
@@ -72,9 +74,8 @@ class ActionSampler:
         q = torch.gather(clouds, 1, q_idx[..., None].expand(-1, -1, 3))[..., :2]  # (M, k, 2)
         p_aimed = outline_entry(clouds, top, q, d, self.line_width)
 
-        p_uniform = torch.stack(
-            [uniform(UNIFORM_LOW[0], UNIFORM_HIGH[0], M, k), uniform(UNIFORM_LOW[1], UNIFORM_HIGH[1], M, k)], -1
-        )
+        lo, hi = self.uniform_low, self.uniform_high
+        p_uniform = torch.stack([uniform(lo[0], hi[0], M, k), uniform(lo[1], hi[1], M, k)], -1)
         use_uniform = (torch.rand(M, k, device=dev) < self.uniform_fraction) | ~has_top[:, None]
         p_xy = torch.where(use_uniform[..., None], p_uniform, p_aimed)
 
@@ -169,7 +170,7 @@ def block_position(clouds, half_size=0.02):
 
 
 def planning_reward(clouds, goal_xy, half_size=0.02, goal_radius=0.1):
-    """The env's reward (env.reward.block_reward, success -> 4) for the block in each cloud.
+    """The env's reward (env.push_block.reward.block_reward, success -> 4) for the block in each cloud.
     The env's reaching term is dropped: the push primitive does the reaching itself."""
     r, success = block_reward(block_position(clouds, half_size), goal_xy, half_size, goal_radius)
     return torch.where(success, torch.full_like(r, 4.0), 1 + r)

@@ -1,8 +1,9 @@
-"""PushBlock-v1's block reward as a plain function of the block position.
+"""PushBlock-v1's block reward as a plain function of the block position, for planners.
 
-The env computes it from the simulator's block pose (PushBlockEnv.compute_dense_reward);
-planners compute it from a predicted block position. Both call this function, so they
-optimize exactly the same thing.
+The env's reward is PushCubeEnv.compute_dense_reward (inherited unchanged), which needs the
+simulator's state. Planners score predicted block positions instead, with this function: the
+block terms of that reward, written as a function of a position. Keep it in sync with
+mani_skill/envs/tasks/tabletop/push_cube.py (place_reward, z_reward, success).
 """
 
 import torch
