@@ -1,13 +1,30 @@
 # Blocks with an off-centre centre of mass
 
-Can a fitted physics latent handle a block whose weight is not in the middle? We moved the block's
-centre of mass (COM) up to 1.5 cm off centre, inside a 4 cm cube, and reran the pipeline: training,
-latent fitting, and MPC on unseen blocks.
+## What this is about
 
-Short answer: fitting the latent still helps the planner reach goals, but the latent never learns
-where the weight is, and rotation predictions don't get better after fitting. A cube looks the same
-after a 90 degree turn, so one latent per block can't say which side is heavy. That is the case for
-a per-point latent map, which we haven't built.
+Our model pushes a block to a goal. Before it starts, it makes a few test pushes to learn how this
+particular block behaves (how heavy it is, how slippery it is). Until now every block had its weight
+evenly spread.
+
+Here we asked: what if the weight is off to one side, like a box with something heavy taped inside?
+Such a block turns when you push it straight, and you can't tell by looking at it. We moved the
+centre of mass (COM) up to 1.5 cm off centre in a 4 cm cube to see whether the test pushes are
+enough for the model to figure that out.
+
+## What we found
+
+- The test pushes still help. With them, our best model (5 models averaged) gets the block to the
+  goal 82% of the time, against 61% without them.
+- But the model never learns where the weight is. It learns how heavy the block is, not which side
+  is heavy.
+- So it keeps getting the turning wrong. After the test pushes it predicts better where the block
+  ends up, but not how much it turns (still off by about 17 degrees).
+
+The reason: a cube looks identical after a quarter turn, and the model sums up each block in a
+single description (the physics latent), so it can't keep track of which side the weight is on. A
+fix would describe the block part by part (a per-point latent map). We haven't built that.
+
+The rest of this page has the details: code changes, how to rerun everything, and the full numbers.
 
 ## What changed in the code
 
