@@ -63,6 +63,7 @@ from dynamics_model.model import (
     DynamicsModel,
     LatentTable,
     point_flow_loss,
+    rotation_error_deg,
     training_objective,
     true_flow_magnitude,
 )
@@ -96,6 +97,9 @@ class Config:
     mass: tuple = (0.05, 1.0)  # kg, log-uniform
     static_friction: tuple = (0.2, 1.0)
     dynamic_ratio: tuple = (0.5, 1.0)  # mu_d = mu_s * U(ratio)  (keeps mu_d <= mu_s)
+    # off-centre centre of mass: max offset radius (m) in the block frame, sampled uniformly in a
+    # disk. 0 = uniform block (pool, physics columns and RNG stream unchanged)
+    com_offset: float = 0.0
     pushes_per_rollout: int = 5  # T
     # algorithm
     init_rollouts: int = 4  # random-policy rollouts for the initial dataset
@@ -208,11 +212,21 @@ def make_physics_pool(cfg: Config, seed=None, size=None):
         {"mass": float(m), "static_friction": float(s), "dynamic_friction": float(d)}
         for m, s, d in zip(mass, mu_s, mu_d)
     ]
+    if cfg.com_offset > 0:  # drawn after the others, so mass/friction match the uniform pool
+        r = cfg.com_offset * np.sqrt(rng.uniform(0, 1, size))  # uniform in the disk
+        ang = rng.uniform(0, 2 * np.pi, size)
+        for p, x, y in zip(pool, r * np.cos(ang), r * np.sin(ang)):
+            p["com_x"], p["com_y"] = float(x), float(y)
     return pool, pool_tensor(pool)
 
 
+PHYSICS_COLUMNS = ["mass", "static_friction", "dynamic_friction", "com_x", "com_y"]
+
+
 def pool_tensor(pool):
-    return torch.tensor([[p["mass"], p["static_friction"], p["dynamic_friction"]] for p in pool], dtype=torch.float32)
+    """(len(pool), 3) mass, mu_s, mu_d; (len(pool), 5) with com_x, com_y when the pool has them."""
+    cols = PHYSICS_COLUMNS if "com_x" in pool[0] else PHYSICS_COLUMNS[:3]
+    return torch.tensor([[p[c] for c in cols] for p in pool], dtype=torch.float32)
 
 
 def settings_for_rollout(counts, num_envs, rng: np.random.Generator):
@@ -288,6 +302,19 @@ def evaluate(model, latents, t, idx):
             b = idx[i:i + 2048]
             R, tr = model(t["pts_in"][b], t["act_feat"][b], latents(t["setting"][b]))
             errs.append(point_flow_loss(t["pts_loss"][b], R, tr, t["R_gt"][b], t["t_gt"][b]))
+    model.train()
+    return torch.cat(errs) if errs else torch.zeros(0)
+
+
+def evaluate_rotation(model, latents, t, idx):
+    """Per-sample rotation error (degrees) of the predicted block motion."""
+    model.eval()
+    errs = []
+    with torch.no_grad():
+        for i in range(0, len(idx), 2048):
+            b = idx[i:i + 2048]
+            R, _ = model(t["pts_in"][b], t["act_feat"][b], latents(t["setting"][b]))
+            errs.append(rotation_error_deg(R, t["R_gt"][b]))
     model.train()
     return torch.cat(errs) if errs else torch.zeros(0)
 
@@ -375,6 +402,7 @@ def train(model, latents, opt, buf, cfg, dev, tb, step, max_steps=None):
     # validation error, overall and on the pushes where the block actually moved (> 5 mm);
     # "no motion" = error of always predicting that the block stays put (= how far it moved)
     val = evaluate(model, latents, t, va_idx)
+    rot = evaluate_rotation(model, latents, t, va_idx)
     still = val_mag
     log_figure()  # final figure, with the restored best model
 
@@ -385,6 +413,8 @@ def train(model, latents, opt, buf, cfg, dev, tb, step, max_steps=None):
         "val_err_moved_cm": 100 * val[moved].mean().item() if moved.any() else float("nan"),
         # error as a fraction of how far the block moved (median over pushes that moved > 5 mm)
         "val_rel_err_moved": (val[moved] / still[moved]).median().item() if moved.any() else float("nan"),
+        "val_rot_err_deg": rot.mean().item() if len(rot) else float("nan"),
+        "val_rot_err_moved_deg": rot[moved].mean().item() if moved.any() else float("nan"),
         "val_no_motion_baseline_cm": 100 * still.mean().item(),
         "val_frac_moved": moved.float().mean().item(),
         "n_train": len(tr_idx),

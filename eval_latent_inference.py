@@ -28,7 +28,7 @@ import torch
 
 from dynamics_model.data import TransitionBuffer
 from dynamics_model.latent_inference import infer_latents
-from dynamics_model.model import DynamicsModel, LatentTable, point_flow_loss
+from dynamics_model.model import DynamicsModel, LatentTable, point_flow_loss, rotation_error_deg
 from env import PushPrimitiveConfig, make_push_env
 from policy.mpc import ActionSampler, ProbeSampler
 from train_dynamics import TEST_SEED, Config, make_physics_pool, run_rollout
@@ -37,21 +37,31 @@ warnings.filterwarnings("ignore")
 
 
 def errors(model, data, idx, z):
-    """Per-transition error (m) and how far the block moved (m)."""
+    """Per-transition error (m), how far the block moved (m), and rotation error (deg)."""
     with torch.no_grad():
         R, t = model(data["pts_in"][idx], data["act_feat"][idx], z)
         err = point_flow_loss(data["pts_loss"][idx], R, t, data["R_gt"][idx], data["t_gt"][idx])
         eye = torch.eye(3, device=R.device).expand(len(idx), 3, 3)
         moved = point_flow_loss(data["pts_loss"][idx], eye, torch.zeros_like(t), data["R_gt"][idx], data["t_gt"][idx])
-    return err, moved
+    return err, moved, rotation_error_deg(R, data["R_gt"][idx])
 
 
-def summarize(err, moved):
+def latent_r2(z, y):
+    """Leave-one-out R^2 of a linear fit (with intercept) from latents z (n, L) to targets y (n, k)."""
+    X = np.concatenate([z, np.ones((len(z), 1))], 1)
+    H = X @ np.linalg.pinv(X)  # hat matrix
+    loo = (y - H @ y) / (1 - np.diag(H))[:, None]  # leave-one-out residuals
+    return 1 - (loo ** 2).sum(0) / ((y - y.mean(0)) ** 2).sum(0)
+
+
+def summarize(err, moved, rot):
     m = moved > 0.005
     return {
         "err_cm": 100 * err.mean().item(),
         "err_moved_cm": 100 * err[m].mean().item() if m.any() else float("nan"),
         "rel_err_moved": (err[m] / moved[m]).median().item() if m.any() else float("nan"),
+        "rot_err_deg": rot.mean().item(),
+        "rot_err_moved_deg": rot[m].mean().item() if m.any() else float("nan"),
     }
 
 
@@ -94,12 +104,13 @@ def main():
     print(f"kept {len(env_of)} transitions (contact rate {stats['contact_rate']:.2f})", flush=True)
 
     # per env: transitions in the order they happened; last `heldout` for evaluation
-    fit_pos, held = [], []
+    fit_pos, held, env_ids = [], [], []
     for e in range(cfg.num_envs):
         idx = (env_of == e).nonzero().flatten()
         if len(idx) <= args.heldout:
             continue
         held.append(idx[-args.heldout:])
+        env_ids.append(e)
         fit_pos.append(idx[:-args.heldout])
     envs = len(held)
     held_idx = torch.cat(held)
@@ -136,14 +147,26 @@ def main():
             "oracle (fitted incl. held-out)": summarize(*errors(model, data, h_idx, z_oracle[h_env])),
         }
 
-    print(f"{'latent':34s} {'err (cm)':>9s} {'err moved (cm)':>15s} {'rel err moved':>14s}")
+    # Latent check: how linearly decodable is each true physics value from the fitted latent?
+    phys = pool_t[env_ids].numpy()
+    targets = {"log_mass": np.log(phys[:, 0]), "static_friction": phys[:, 1], "dynamic_friction": phys[:, 2]}
+    if phys.shape[1] >= 5:
+        targets.update(com_x=phys[:, 3], com_y=phys[:, 4], com_radius=np.hypot(phys[:, 3], phys[:, 4]))
+    r2 = latent_r2(z_oracle.cpu().numpy(), np.stack(list(targets.values()), 1))
+    latent_check = {k: float(v) for k, v in zip(targets, r2)}
+
+    print(f"{'latent':34s} {'err (cm)':>9s} {'err moved (cm)':>15s} {'rel err moved':>14s} {'rot (deg)':>10s}")
     for k, block in results.items():
         print(f"-- k = {k} ({block['envs']} envs)")
         for name, r in block.items():
             if name != "envs":
-                print(f"   {name:31s} {r['err_cm']:9.2f} {r['err_moved_cm']:15.2f} {r['rel_err_moved']:14.2f}")
+                print(f"   {name:31s} {r['err_cm']:9.2f} {r['err_moved_cm']:15.2f} {r['rel_err_moved']:14.2f}"
+                      f" {r['rot_err_deg']:10.2f}")
+    print(f"\nlatent check ({envs} envs, oracle latents, leave-one-out linear R^2):")
+    for k, v in latent_check.items():
+        print(f"   {k:18s} {v:6.3f}")
     out = Path(args.out) if args.out else Path(args.checkpoint).parent / "latent_inference.json"
-    out.write_text(json.dumps({"args": vars(args), "results": results}, indent=2))
+    out.write_text(json.dumps({"args": vars(args), "results": results, "latent_r2": latent_check}, indent=2))
     print(f"\nsaved {out}")
 
 

@@ -7,6 +7,7 @@ the same val split, with a long early-stopping budget. Logs to TensorBoard under
 """
 
 import argparse
+import json
 import sys
 import time
 import warnings
@@ -30,6 +31,8 @@ def main():
     ap.add_argument("--encoders", nargs="+", default=["pointnet", "cross_attn", "transformer"])
     ap.add_argument("--max-steps", type=int, default=30000)
     ap.add_argument("--patience", type=int, default=30, help="val checks (x100 steps) without improvement")
+    ap.add_argument("--mirror-aug", action=argparse.BooleanOptionalAction, default=True,
+                    help="mirror augmentation (turn off for off-centre COM data)")
     args = ap.parse_args()
 
     buf = TransitionBuffer.load(args.dataset)
@@ -41,10 +44,11 @@ def main():
     bins = [(0.005, 0.05), (0.05, 0.15), (0.15, 0.3)]
     print(f"dataset {len(buf)} (train {len(tr)}, val {len(va)})", flush=True)
     print(f"{'encoder':12s} {'steps':>6s} {'train-set':>9s} {'val':>6s}" +
-          "".join(f"{f'{100*lo:.1f}-{100*hi:.0f}cm':>16s}" for lo, hi in bins) + f"{'minutes':>8s}", flush=True)
+          "".join(f"{f'{100*lo:.1f}-{100*hi:.0f}cm':>16s}" for lo, hi in bins) + f"{'rot(deg)':>9s}{'minutes':>8s}", flush=True)
+    results = {}
     for enc in args.encoders:
         torch.manual_seed(0)
-        c = T.Config(max_train_steps=args.max_steps, patience=args.patience, encoder=enc)
+        c = T.Config(max_train_steps=args.max_steps, patience=args.patience, encoder=enc, mirror_aug=args.mirror_aug)
         model = DynamicsModel(latent_dim=c.latent_dim, encoder=enc).to(dev)
         lat = LatentTable(n_settings, c.latent_dim).to(dev)
         opt = torch.optim.AdamW([{"params": model.parameters(), "lr": c.lr, "weight_decay": c.weight_decay},
@@ -53,9 +57,15 @@ def main():
         r = T.train(model, lat, opt, buf, c, dev, SummaryWriter(f"{args.out}/{enc}"), [0])
         err = T.evaluate(model, lat, t, va)
         tr_err = T.evaluate(model, lat, t, tr).mean().item()
+        rot = T.evaluate_rotation(model, lat, t, va)
         cells = "".join(f"{100*err[(mag >= lo) & (mag < hi)].mean():8.2f}cm"
                         f"({(err[(mag >= lo) & (mag < hi)] / mag[(mag >= lo) & (mag < hi)]).median():4.2f})" for lo, hi in bins)
-        print(f"{enc:12s} {r['steps']:6d} {100*tr_err:8.2f}cm {100*err.mean():5.2f}{cells}{(time.time()-t0)/60:8.1f}", flush=True)
+        print(f"{enc:12s} {r['steps']:6d} {100*tr_err:8.2f}cm {100*err.mean():5.2f}{cells}{rot.mean():9.2f}{(time.time()-t0)/60:8.1f}", flush=True)
+        moved = mag > 0.005
+        results[enc] = {"steps": r["steps"], "train_err_cm": 100 * tr_err, "val_err_cm": 100 * err.mean().item(),
+                        "val_err_moved_cm": 100 * err[moved].mean().item(), "val_rot_err_deg": rot.mean().item(),
+                        "val_rot_err_moved_deg": rot[moved].mean().item()}
+        Path(args.out, "results.json").write_text(json.dumps(results, indent=2))
         torch.save({"model": model.state_dict(), "latents": lat.state_dict(), "encoder": enc}, f"{args.out}/{enc}/model.pt")
 
 

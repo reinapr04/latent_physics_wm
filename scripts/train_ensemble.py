@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 
 import train_dynamics as T  # noqa: E402
 from dynamics_model.data import TransitionBuffer  # noqa: E402
-from dynamics_model.model import DynamicsModel, LatentTable, apply_rigid, true_flow_magnitude  # noqa: E402
+from dynamics_model.model import DynamicsModel, LatentTable, apply_rigid, rotation_error_deg, true_flow_magnitude  # noqa: E402
 from torch.utils.tensorboard import SummaryWriter  # noqa: E402
 
 BINS = [(0.005, 0.05), (0.05, 0.15), (0.15, 0.3), (0.3, 10.0)]
@@ -32,25 +32,32 @@ BINS = [(0.005, 0.05), (0.05, 0.15), (0.15, 0.3), (0.3, 10.0)]
 
 @torch.no_grad()
 def predicted_points(model, latents, t, idx):
-    """Block points moved by the model's predicted motion, (len(idx), N, 3)."""
+    """Block points moved by the model's predicted motion, (len(idx), N, 3), and the predicted R."""
     model.eval()
-    out = []
+    out, rots = [], []
     for i in range(0, len(idx), 1024):
         b = idx[i:i + 1024]
         R, tr = model(t["pts_in"][b], t["act_feat"][b], latents(t["setting"][b]))
         out.append(apply_rigid(t["pts_loss"][b], R, tr))
-    return torch.cat(out)
+        rots.append(R)
+    return torch.cat(out), torch.cat(rots)
 
 
-def report(name, pred, gt, mag):
+def report(name, pred, gt, mag, R_pred, R_gt):
     err = (pred - gt).norm(dim=-1).mean(-1)
+    # mean of the members' R is not exactly a rotation; project it back with SVD
+    U, _, Vh = torch.linalg.svd(R_pred)
+    D = torch.ones_like(R_pred[:, :, 0])
+    D[:, -1] = torch.linalg.det(U @ Vh).sign()
+    rot = rotation_error_deg(U @ torch.diag_embed(D) @ Vh, R_gt)
     cells = ""
     for lo, hi in BINS:
         m = (mag >= lo) & (mag < hi)
         cells += f"{100 * err[m].mean():8.2f}cm({(err[m] / mag[m]).median():4.2f})"
     moved = mag > 0.005
-    print(f"{name:22s} {100 * err.mean():6.2f}cm {100 * err[moved].mean():8.2f}cm{cells}", flush=True)
-    return {"val_err_cm": 100 * err.mean().item(), "val_err_moved_cm": 100 * err[moved].mean().item()}
+    print(f"{name:22s} {100 * err.mean():6.2f}cm {100 * err[moved].mean():8.2f}cm{cells} {rot.mean():7.2f}deg", flush=True)
+    return {"val_err_cm": 100 * err.mean().item(), "val_err_moved_cm": 100 * err[moved].mean().item(),
+            "val_rot_err_deg": rot.mean().item(), "val_rot_err_moved_deg": rot[moved].mean().item()}
 
 
 def main():
@@ -61,6 +68,8 @@ def main():
     ap.add_argument("--members", type=int, default=5)
     ap.add_argument("--steps", type=int, default=20000, help="training steps per member (no early stopping)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mirror-aug", action=argparse.BooleanOptionalAction, default=True,
+                    help="mirror augmentation (turn off for off-centre COM data)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -76,11 +85,12 @@ def main():
     header = f"{'':22s} {'val':>8s} {'val moved':>10s}" + "".join(
         f"{f'{100*lo:.1f}-{100*hi:.0f}cm':>16s}" for lo, hi in BINS)
 
-    preds, results = [], {}
+    preds, rots, results = [], [], {}
+    R_gt = t["R_gt"][va]
     for k in range(args.members):
         seed = args.seed + k
         torch.manual_seed(seed)
-        c = T.Config(max_train_steps=args.steps, patience=10 ** 9, encoder=args.encoder)
+        c = T.Config(max_train_steps=args.steps, patience=10 ** 9, encoder=args.encoder, mirror_aug=args.mirror_aug)
         model = DynamicsModel(latent_dim=c.latent_dim, encoder=args.encoder).to(dev)
         lat = LatentTable(n_settings, c.latent_dim).to(dev)
         opt = torch.optim.AdamW([{"params": model.parameters(), "lr": c.lr, "weight_decay": c.weight_decay},
@@ -89,11 +99,14 @@ def main():
         T.train(model, lat, opt, buf, c, dev, SummaryWriter(str(out / f"member{k}")), [0])
         torch.save({"model": model.state_dict(), "latents": lat.state_dict(), "encoder": args.encoder, "seed": seed},
                    out / f"member{k}" / "model.pt")
-        preds.append(predicted_points(model, lat, t, va))
+        p, R = predicted_points(model, lat, t, va)
+        preds.append(p)
+        rots.append(R)
         print(f"\nmember {k} trained in {(time.time() - t0) / 60:.1f} min", flush=True)
         print(header, flush=True)
-        results[f"member{k}"] = report(f"member {k} alone", preds[-1], gt, mag)
-        results[f"ensemble_of_{k + 1}"] = report(f"ensemble of {k + 1}", torch.stack(preds).mean(0), gt, mag)
+        results[f"member{k}"] = report(f"member {k} alone", preds[-1], gt, mag, rots[-1], R_gt)
+        results[f"ensemble_of_{k + 1}"] = report(f"ensemble of {k + 1}", torch.stack(preds).mean(0), gt, mag,
+                                                 torch.stack(rots).mean(0), R_gt)
         (out / "results.json").write_text(json.dumps(results, indent=2))
     print("\ncells: mean error (median error / distance moved)", flush=True)
 

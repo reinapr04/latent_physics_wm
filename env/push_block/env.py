@@ -64,6 +64,9 @@ class BlockPhysicsConfig:
     restitution: Param = 0.0  # bounciness, in [0, 1]
     linear_damping: Param = 0.0
     angular_damping: Param = 0.0
+    # centre of mass offset from the geometric centre, in the block's own frame (m). 0 = uniform block
+    com_x: Param = 0.0
+    com_y: Param = 0.0
 
     # Table surface friction. None keeps ManiSkill's default. PhysX averages the
     # friction of the two touching materials, so the block-table friction is
@@ -193,7 +196,7 @@ class PushBlockEnv(PushCubeEnv):
                 half_size=[h] * 3,
                 material=sapien.render.RenderMaterial(base_color=np.array([12, 42, 160, 255]) / 255),
             )
-            builder.set_mass_and_inertia(p["mass"], sapien.Pose(), _box_inertia(p["mass"], h))
+            builder.set_mass_and_inertia(p["mass"], sapien.Pose(p=[p["com_x"], p["com_y"], 0.0]), _box_inertia(p["mass"], h))
             builder.set_scene_idxs([i])
             builder.set_initial_pose(sapien.Pose(p=[0, 0, h]))
             block = builder.build(name=f"block-{i}")
