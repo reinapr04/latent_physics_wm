@@ -189,6 +189,12 @@ def point_flow_loss(pts, R_pred, t_pred, R_gt, t_gt):
     return (apply_rigid(pts, R_pred, t_pred) - apply_rigid(pts, R_gt, t_gt)).norm(dim=-1).mean(-1)
 
 
+def rotation_error_deg(R_pred, R_gt):
+    """Geodesic angle (degrees) between predicted and true rotations, per sample (B,)."""
+    cos = ((R_pred.transpose(-1, -2) @ R_gt).diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2
+    return torch.rad2deg(torch.arccos(cos.clamp(-1.0, 1.0)))
+
+
 def true_flow_magnitude(pts, R_gt, t_gt):
     """How far the block's points actually moved (mean distance, m), per sample (B,)."""
     return (apply_rigid(pts, R_gt, t_gt) - pts).norm(dim=-1).mean(-1)

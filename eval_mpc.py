@@ -100,6 +100,8 @@ def main():
     ap.add_argument("--conditions", nargs="+", default=["mean", "fitted", "fitted_N"])
     ap.add_argument("--video-envs", type=int, default=16, help="envs rendered to video per condition (0 = no video)")
     ap.add_argument("--video-stride", type=int, default=2, help="keep every n-th control step in the video")
+    ap.add_argument("--com-offset", type=float, default=None,
+                    help="m, max COM offset of the test blocks (default: the checkpoint's training config, else 0)")
     ap.add_argument("--out", default=None, help="default: <checkpoint dir>/mpc_eval.json")
     args = ap.parse_args()
     t_start = time.time()
@@ -107,7 +109,11 @@ def main():
     out = Path(args.out) if args.out else (ck if ck.is_dir() else ck.parent) / "mpc_eval.json"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg = Config(seed=args.seed, num_envs=args.num_envs, pool_size=args.num_envs)
+    com = args.com_offset
+    if com is None:  # a checkpoint file from train_dynamics.py carries its training config
+        com = torch.load(ck, map_location="cpu").get("config", {}).get("com_offset", 0.0) if ck.is_file() else 0.0
+    cfg = Config(seed=args.seed, num_envs=args.num_envs, pool_size=args.num_envs, com_offset=com)
+    print(f"test blocks: COM offset up to {100 * com:.1f} cm", flush=True)
     pool, pool_t = make_physics_pool(cfg)  # same ranges as training, unseen seed
     n_vid = min(args.video_envs, args.num_envs)
     render_kw = dict(render_mode="rgb_array", human_render_camera_configs=dict(
@@ -213,7 +219,9 @@ def main():
                 for s in range(0, frames.shape[0], args.video_stride):
                     tiles = [annotate(frames[s, i].numpy(), [
                         f"env{i} {c}  {phys['mass'][i]:.2f}kg mu {phys['static_friction'][i]:.2f}"
-                        f"/{phys['dynamic_friction'][i]:.2f}", status[i][0]], status[i][1], font)
+                        f"/{phys['dynamic_friction'][i]:.2f}"
+                        + (f" com {100 * phys['com_x'][i]:+.1f},{100 * phys['com_y'][i]:+.1f}cm" if com else ""),
+                        status[i][0]], status[i][1], font)
                         for i in range(n_vid)]
                     writer.append_data(grid(tiles, math.ceil(math.sqrt(n_vid))))
             if done.all():
@@ -253,7 +261,7 @@ def main():
     if n_vid:
         print("\nvideos: " + ", ".join(str(out.parent / f"mpc_{c}.mp4") for c in args.conditions))
 
-    out.write_text(json.dumps({"args": vars(args), "checkpoints": files, "start_to_goal_cm": d0.mean().item(),
+    out.write_text(json.dumps({"args": vars(args), "com_offset": com, "checkpoints": files, "start_to_goal_cm": d0.mean().item(),
                                "results": results, "distance_curves_cm": curves}, indent=2))
     print(f"\nsaved {out}  ({(time.time() - t_start) / 60:.1f} min)")
 
