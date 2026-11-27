@@ -78,8 +78,7 @@ def main():
 
     env = make_push_env(num_envs=cfg.num_envs, obs_mode="pointcloud", push_config=PushPrimitiveConfig(phase_timeout=2.0))
     dev = env.unwrapped.device
-    model = DynamicsModel(latent_dim=cfg.latent_dim, encoder=cfg.encoder).to(dev)
-    model.load_state_dict(ckpt["model"])
+    model = DynamicsModel.from_checkpoint(ckpt, dev)
     train_latents = LatentTable(ckpt["latents"]["emb.weight"].shape[0], cfg.latent_dim).to(dev)
     train_latents.load_state_dict(ckpt["latents"])
     z_mean = train_latents.emb.weight.mean(0)

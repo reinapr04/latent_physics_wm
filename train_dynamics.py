@@ -114,6 +114,10 @@ class Config:
     # model / training
     encoder: str = "pointnet"  # pointnet | pointnet_early | cross_attn | transformer (dynamics_model/model.py)
     latent_dim: int = 8
+    # model size: point feature width, MLP head hidden width and number of head layers
+    feat_dim: int = 128
+    hidden: int = 256
+    head_layers: int = 3
     # model input points: every observed point above the table (the block shows ~150-330), then
     # min(table_points, n_in - block points) table points spread evenly by farthest point
     # sampling, then repeats of the block points to fill
@@ -176,6 +180,7 @@ def task_spec(name):
             workspace=(WORKSPACE_LOW, WORKSPACE_HIGH),
             height=(0.01, 0.05),  # m, p_z of sampled pushes (the block is 4 cm tall)
             uniform_box=(UNIFORM_LOW, UNIFORM_HIGH),
+            line_width=0.005,  # m, half-width of the strip an aimed push's contact point is searched in
             action_scale=ACTION_SCALE,
         )
     if name == "push_t":
@@ -186,6 +191,9 @@ def task_spec(name):
             workspace=PUSH_T_WORKSPACE,
             height=(0.01, 0.035),  # m, stick tip heights that touch the 4 cm T
             uniform_box=((-0.40, -0.35), (0.10, 0.30)),  # around the T's spawn area and goal
+            # the stick is 16 mm wide: searching a strip of its radius + 1 mm makes p the first
+            # contact of its whole width, so its run-up behind p is clear of the T
+            line_width=0.009,
             action_scale=(0.04, 20.0, 1.0),  # p_z (m), F (N), T (s)
         )
     raise ValueError(f"unknown task {name!r}; choose from {TASKS}")
@@ -458,7 +466,9 @@ def main():
     env = task.make_env(cfg.num_envs)
     dev = env.unwrapped.device
 
-    model = DynamicsModel(latent_dim=cfg.latent_dim, encoder=cfg.encoder, action_scale=task.action_scale).to(dev)
+    model_kwargs = dict(latent_dim=cfg.latent_dim, encoder=cfg.encoder, feat_dim=cfg.feat_dim, hidden=cfg.hidden,
+                        layers=cfg.head_layers, action_scale=tuple(task.action_scale))
+    model = DynamicsModel(**model_kwargs).to(dev)
     latents = LatentTable(len(pool), cfg.latent_dim).to(dev)
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])
@@ -472,7 +482,8 @@ def main():
         {"params": latents.parameters(), "lr": cfg.latent_lr, "weight_decay": 0.0},
     ])
     ranges = dict(force=(cfg.min_force, cfg.max_force), duration=(cfg.min_duration, cfg.max_duration),
-                  height=task.height, uniform_low=task.uniform_box[0], uniform_high=task.uniform_box[1])
+                  height=task.height, uniform_low=task.uniform_box[0], uniform_high=task.uniform_box[1],
+                  line_width=task.line_width)
     random_sampler = ActionSampler(uniform_fraction=cfg.random_uniform_fraction, **ranges)
     mpc_sampler = ActionSampler(uniform_fraction=cfg.mpc_uniform_fraction, **ranges)
     log = open(run_dir / "metrics.jsonl", "a")
@@ -483,7 +494,8 @@ def main():
 
     def save():
         torch.save({"model": model.state_dict(), "latents": latents.state_dict(), "config": asdict(cfg),
-                    "encoder": cfg.encoder, "task": cfg.task, "physics_pool": pool}, run_dir / "checkpoint.pt")
+                    "encoder": cfg.encoder, "task": cfg.task, "model_kwargs": model_kwargs, "physics_pool": pool},
+                   run_dir / "checkpoint.pt")
         buf.save(run_dir / "dataset.pt")
     tb = SummaryWriter(str(run_dir / "tb"))
     step = [0]  # global gradient step
@@ -514,10 +526,12 @@ def main():
         return a
 
     t0 = time.time()
-    for _ in range(cfg.init_rollouts):
+    for k in range(cfg.init_rollouts):
         emit({"phase": "random", "rollout": rollout,
               **run_rollout(env, cfg, pool, pool_t, next_settings(), random_policy, buf, rollout)})
         rollout += 1
+        if (k + 1) % 10 == 0:
+            save()  # dataset so far (+ the untrained model): a stopped run can --resume-from it
 
     for it in range(cfg.iterations):
         emit({"phase": "train", "iteration": it, **train(model, latents, opt, buf, cfg, dev, tb, step)})

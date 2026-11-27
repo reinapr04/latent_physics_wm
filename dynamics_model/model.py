@@ -135,6 +135,17 @@ class DynamicsModel(nn.Module):
         nn.init.zeros_(self.head[-1].bias)
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
 
+    @classmethod
+    def from_checkpoint(cls, ckpt, device=None):
+        """Rebuild a saved model. Checkpoints store their constructor arguments in
+        "model_kwargs"; older ones (default sizes) only stored the encoder."""
+        kwargs = ckpt.get("model_kwargs") or dict(
+            latent_dim=ckpt["latents"]["emb.weight"].shape[1],
+            encoder=ckpt.get("encoder", ckpt.get("config", {}).get("encoder", "pointnet")))
+        model = cls(**kwargs).to(device)
+        model.load_state_dict(ckpt["model"])  # includes the action scale it was trained with
+        return model
+
     def forward(self, pts_frame, act_feat, z):
         """pts_frame (B, N, 3): input cloud in the action frame; act_feat (B, 3): (p_z, F, T);
         z (B, latent_dim). Returns rotation matrices (B, 3, 3) and translations (B, 3), m."""

@@ -66,9 +66,7 @@ def load_model(path, dev):
     for f in files:
         ck = torch.load(f, map_location=dev)
         lat = ck["latents"]["emb.weight"]
-        m = DynamicsModel(latent_dim=lat.shape[1], encoder=ck.get("encoder", "pointnet")).to(dev)
-        m.load_state_dict(ck["model"])
-        members.append(m.eval())
+        members.append(DynamicsModel.from_checkpoint(ck, dev).eval())
         z_means.append(lat.mean(0))
     model = members[0] if len(members) == 1 else Ensemble(members).eval()
     return model, torch.cat(z_means), [str(f) for f in files]
